@@ -11,8 +11,6 @@
 .DESCRIPTION
     This script allows you to scan available WiFi networks, identify their frequency bands,
     and force your computer to connect to a specific band (2.4GHz or 5GHz).
-    
-    Useful when your device keeps connecting to 2.4GHz when 5GHz is available.
 
 .NOTES
     File Name      : WifiBandSwitcher.ps1
@@ -23,7 +21,9 @@
 param (
     [switch]$ScanOnly,
     [string]$SSID,
-    [string]$Band
+    [string]$Band,
+    [switch]$Verbose,
+    [switch]$Debug
 )
 
 # Require admin privileges
@@ -34,194 +34,136 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     exit 1
 }
 
-# Check if WiFi is available
-try {
-    $wlanInterfaces = (netsh wlan show interfaces) -split "`r`n"
-    $hasWifi = $false
-    foreach ($line in $wlanInterfaces) {
-        if ($line -match "State\s+:\s+connected" -or $line -match "State\s+:\s+disconnected") {
-            $hasWifi = $true
-            break
-        }
-    }
-    if (-not $hasWifi) {
-        Write-Host ("No WiFi adapter found on this system.") -ForegroundColor Red
-        exit 1
-    }
-} catch {
-    Write-Host ("Error checking WiFi adapter: $_") -ForegroundColor Red
-    exit 1
-}
-
 # Function to determine band from channel
 function Get-BandFromChannel {
     param([int]$Channel)
-    
-    # 2.4 GHz: channels 1-14
-    if ($Channel -ge 1 -and $Channel -le 14) {
-        return "2.4GHz"
-    }
-    # 5 GHz: channels 36-165
-    elseif ($Channel -ge 36 -and $Channel -le 165) {
-        return "5GHz"
-    }
-    # 6 GHz: channels 1-233 (WiFi 6E)
-    elseif ($Channel -ge 1 -and $Channel -le 233) {
-        return "6GHz"
-    }
-    else {
-        return "Unknown"
-    }
+    if ($Channel -ge 1 -and $Channel -le 14) { return "2.4GHz" }
+    elseif ($Channel -ge 36 -and $Channel -le 165) { return "5GHz" }
+    elseif ($Channel -ge 1 -and $Channel -le 233) { return "6GHz" }
+    else { return "Unknown" }
 }
 
-# Function to get available WiFi networks with band information
+# Function to parse netsh output and get all BSSIDs with bands
 function Get-AvailableWifiNetworks {
-    Write-Host "`nScanning for available WiFi networks..." -ForegroundColor Cyan
+    Write-Host ("`nScanning for available WiFi networks...") -ForegroundColor Cyan
     
-    $networks = @()
+    $networks = @{}
+    $output = netsh wlan show networks mode=bssid 2>&1
     
-    try {
-        $output = netsh wlan show networks mode=bssid 2>&1
+    if ($Debug) {
+        Write-Host "`n[DEBUG] Raw netsh output:" -ForegroundColor DarkGray
+        Write-Host $output
+        Write-Host "`n[DEBUG] End of raw output`n" -ForegroundColor DarkGray
+    }
+    
+    $currentSSID = $null
+    
+    foreach ($line in $output -split "`r`n") {
+        $line = $line.Trim()
         
-        $currentNetwork = $null
-        $currentBSSID = $null
-        $currentSSID = $null
+        if ($Debug) { Write-Host "[DEBUG] Processing: $line" -ForegroundColor DarkGray }
         
-        foreach ($line in $output -split "`r`n") {
-            $line = $line.Trim()
-            
-            if ($line -match "^\s*SSID \d+\s+:\s+(.+)") {
-                $currentSSID = $matches[1]
-                $currentNetwork = [PSCustomObject]@{
+        # Match SSID line - various formats
+        if ($line -match "SSID\s+\d+\s*:\s*(.+)" -or $line -match "SSID\s*:\s*(.+)") {
+            $currentSSID = $matches[1].Trim()
+            if ($Debug) { Write-Host "[DEBUG] Found SSID: $currentSSID" -ForegroundColor Green }
+            if (-not $networks.ContainsKey($currentSSID)) {
+                $networks[$currentSSID] = @{
                     SSID = $currentSSID
                     BSSIDs = @()
-                    SignalStrength = 0
-                    BestBSSID = $null
+                    Bands = @{}
+                    BestSignal = 0
                 }
-                $networks += $currentNetwork
             }
-            elseif ($line -match "^\s*BSSID \d+\s+:\s+([0-9a-fA-F-]+)") {
-                $currentBSSID = $matches[1]
-                $bssidObj = [PSCustomObject]@{
-                    BSSID = $currentBSSID
+        }
+        # Match BSSID line
+        elseif ($line -match "BSSID\s+\d+\s*:\s*([0-9a-fA-F-]+)" -or $line -match "BSSID\s*:\s*([0-9a-fA-F-]+)") {
+            $bssid = $matches[1].Trim()
+            if ($currentSSID -and $networks.ContainsKey($currentSSID)) {
+                if ($Debug) { Write-Host "[DEBUG] Found BSSID: $bssid for SSID: $currentSSID" -ForegroundColor Green }
+                $bssidObj = @{
+                    BSSID = $bssid
                     Channel = $null
-                    Frequency = $null
-                    Band = $null
+                    Band = "Unknown"
                     Signal = 0
                 }
-                if ($currentNetwork) {
-                    $currentNetwork.BSSIDs += $bssidObj
-                }
+                $networks[$currentSSID].BSSIDs += $bssidObj
             }
-            elseif ($line -match "^\s*Signal\s+:\s+(\d+)%") {
-                $signal = [int]$matches[1]
-                if ($currentNetwork -and $currentNetwork.BSSIDs.Count -gt 0) {
-                    $currentNetwork.BSSIDs[$currentNetwork.BSSIDs.Count - 1].Signal = $signal
-                    if ($signal -gt $currentNetwork.SignalStrength) {
-                        $currentNetwork.SignalStrength = $signal
-                        $currentNetwork.BestBSSID = $currentNetwork.BSSIDs[$currentNetwork.BSSIDs.Count - 1].BSSID
-                    }
+        }
+        # Match Signal line
+        elseif ($line -match "Signal\s*:\s*(\d+)%") {
+            $signal = [int]$matches[1]
+            if ($currentSSID -and $networks.ContainsKey($currentSSID) -and 
+                $networks[$currentSSID].BSSIDs.Count -gt 0) {
+                $lastBSSID = $networks[$currentSSID].BSSIDs[$networks[$currentSSID].BSSIDs.Count - 1]
+                $lastBSSID.Signal = $signal
+                if ($signal -gt $networks[$currentSSID].BestSignal) {
+                    $networks[$currentSSID].BestSignal = $signal
                 }
+                if ($Debug) { Write-Host "[DEBUG] Set signal $signal for last BSSID" -ForegroundColor Green }
             }
-            elseif ($line -match "^\s*Channel\s+:\s+(\d+)") {
-                $channel = [int]$matches[1]
-                if ($currentNetwork -and $currentNetwork.BSSIDs.Count -gt 0) {
-                    $currentNetwork.BSSIDs[$currentNetwork.BSSIDs.Count - 1].Channel = $channel
-                    $currentNetwork.BSSIDs[$currentNetwork.BSSIDs.Count - 1].Band = Get-BandFromChannel -Channel $channel
-                }
-            }
-            elseif ($line -match "^\s*Primary channels\s+:\s+([\d,]+)") {
-                $channels = $matches[1] -split ","
-                if ($channels.Count -gt 0 -and $currentBSSID -and $currentNetwork) {
-                    $channel = [int]$channels[0]
-                    foreach ($bssid in $currentNetwork.BSSIDs) {
-                        if ($bssid.BSSID -eq $currentBSSID -and $bssid.Channel -eq $null) {
-                            $bssid.Channel = $channel
-                            $bssid.Band = Get-BandFromChannel -Channel $channel
-                            break
-                        }
+        }
+        # Match Channel line - also check for "Primary channels"
+        elseif ($line -match "Channel\s*:\s*(\d+)" -or $line -match "Primary channels\s*:\s*(\d+)") {
+            $channel = [int]$matches[1]
+            $band = Get-BandFromChannel -Channel $channel
+            if ($currentSSID -and $networks.ContainsKey($currentSSID) -and 
+                $networks[$currentSSID].BSSIDs.Count -gt 0) {
+                $lastBSSID = $networks[$currentSSID].BSSIDs[$networks[$currentSSID].BSSIDs.Count - 1]
+                if ($lastBSSID.Channel -eq $null) {
+                    $lastBSSID.Channel = $channel
+                    $lastBSSID.Band = $band
+                    if (-not $networks[$currentSSID].Bands.ContainsKey($band)) {
+                        $networks[$currentSSID].Bands[$band] = $true
+                        if ($Debug) { Write-Host "[DEBUG] Found band $band for SSID $currentSSID" -ForegroundColor Green }
                     }
                 }
             }
         }
-        
-        # Deduplicate and clean up
-        $uniqueNetworks = @{}
-        foreach ($net in $networks) {
-            if ($net.SSID -ne "") {
-                if (-not $uniqueNetworks.ContainsKey($net.SSID)) {
-                    $uniqueNetworks[$net.SSID] = $net
-                } else {
-                    foreach ($bssid in $net.BSSIDs) {
-                        $exists = $false
-                        foreach ($existingBssid in $uniqueNetworks[$net.SSID].BSSIDs) {
-                            if ($existingBssid.BSSID -eq $bssid.BSSID) {
-                                $exists = $true
-                                break
-                            }
-                        }
-                        if (-not $exists) {
-                            $uniqueNetworks[$net.SSID].BSSIDs += $bssid
-                        }
-                    }
-                }
-            }
-        }
-        
-        # Build final list with band information
-        $result = @()
-        foreach ($key in $uniqueNetworks.Keys) {
-            $net = $uniqueNetworks[$key]
-            $bands = @{}
-            $bandSignals = @{}
-            
-            foreach ($bssid in $net.BSSIDs) {
-                if ($bssid.Band -and $bssid.Band -ne "Unknown") {
-                    if (-not $bands.ContainsKey($bssid.Band)) {
-                        $bands[$bssid.Band] = @()
-                        $bandSignals[$bssid.Band] = 0
-                    }
-                    $bands[$bssid.Band] += $bssid
-                    if ($bssid.Signal -gt $bandSignals[$bssid.Band]) {
-                        $bandSignals[$bssid.Band] = $bssid.Signal
-                    }
-                }
-            }
-            
-            $netObj = [PSCustomObject]@{
-                SSID = $net.SSID
-                AvailableBands = [System.Collections.Generic.List[string]]::new()
-                BandDetails = [System.Collections.Generic.Dictionary[string,object]]::new()
-                BestSignal = $net.SignalStrength
-            }
-            
-            foreach ($band in $bands.Keys) {
-                $netObj.AvailableBands.Add($band)
-                $bssidsForBand = $bands[$band] | Sort-Object Signal -Descending
-                $netObj.BandDetails[$band] = @{
-                    BSSIDs = $bssidsForBand | ForEach-Object { $_.BSSID }
-                    BestBSSID = $bssidsForBand[0].BSSID
-                    Signal = $bandSignals[$band]
-                }
-            }
-            
-            $result += $netObj
-        }
-        
-        return $result | Sort-Object SSID
-        
-    } catch {
-        Write-Host ("Error scanning networks: $_") -ForegroundColor Red
-        return @()
     }
+    
+    if ($Debug) {
+        Write-Host "`n[DEBUG] Parsed networks:" -ForegroundColor DarkGray
+        foreach ($key in $networks.Keys) {
+            Write-Host "[DEBUG] SSID: $key, Bands: $($networks[$key].Bands.Keys -join ','), BSSIDs: $($networks[$key].BSSIDs.Count)" -ForegroundColor Green
+            foreach ($b in $networks[$key].BSSIDs) {
+                Write-Host "[DEBUG]   BSSID: $($b.BSSID), Channel: $($b.Channel), Band: $($b.Band), Signal: $($b.Signal)%" -ForegroundColor Green
+            }
+        }
+    }
+    
+    # Convert to array of objects
+    $result = @()
+    foreach ($key in $networks.Keys | Sort-Object) {
+        $net = $networks[$key]
+        $netObj = [PSCustomObject]@{
+            SSID = $net.SSID
+            BestSignal = $net.BestSignal
+            AvailableBands = [System.Collections.Generic.List[string]]::new()
+            BSSIDDetails = $net.BSSIDs
+        }
+        
+        $bandList = $net.Bands.Keys | Sort-Object { 
+            if ($_ -eq "2.4GHz") { 1 }
+            elseif ($_ -eq "5GHz") { 2 }
+            elseif ($_ -eq "6GHz") { 3 }
+            else { 4 }
+        }
+        foreach ($band in $bandList) {
+            $netObj.AvailableBands.Add($band)
+        }
+        
+        $result += $netObj
+    }
+    
+    return $result
 }
 
 # Function to connect to a specific WiFi network on a specific band
 function Connect-ToWifiBand {
     param(
         [string]$SSID,
-        [string]$Band,
-        [string]$BSSID = $null
+        [string]$Band
     )
     
     Write-Host ("`nAttempting to connect to '$SSID' on $Band band...") -ForegroundColor Yellow
@@ -229,7 +171,7 @@ function Connect-ToWifiBand {
     $currentInterface = netsh wlan show interfaces 2>&1
     $connectedSSID = $null
     foreach ($line in $currentInterface -split "`r`n") {
-        if ($line -match "^\s*SSID\s+:\s+(.+)") {
+        if ($line -match "SSID\s*:\s*(.+)") {
             $connectedSSID = $matches[1].Trim()
             break
         }
@@ -249,36 +191,39 @@ function Connect-ToWifiBand {
         return $false
     }
     
-    $bssid = $BSSID
-    if ([string]::IsNullOrEmpty($bssid)) {
-        $bssid = $targetNetwork.BandDetails[$Band].BestBSSID
+    $bestBSSID = $null
+    $bestSignal = 0
+    foreach ($bssid in $targetNetwork.BSSIDDetails) {
+        if ($bssid.Band -eq $Band -and $bssid.Signal -gt $bestSignal) {
+            $bestSignal = $bssid.Signal
+            $bestBSSID = $bssid.BSSID
+        }
     }
     
-    if ([string]::IsNullOrEmpty($bssid)) {
+    if (-not $bestBSSID) {
         Write-Host ("No BSSID found for $SSID on $Band band.") -ForegroundColor Red
+        Write-Host ("This might mean the $Band band is currently unavailable or out of range.") -ForegroundColor Yellow
         return $false
     }
     
-    Write-Host ("Connecting to BSSID: $bssid") -ForegroundColor Cyan
+    Write-Host ("Connecting to BSSID: $bestBSSID (Channel: $($targetNetwork.BSSIDDetails | Where-Object { $_.BSSID -eq $bestBSSID } | Select-Object -ExpandProperty Channel), Signal: $bestSignal%)") -ForegroundColor Cyan
     
     try {
         Write-Host ("Connecting to $SSID...") -ForegroundColor Cyan
-        
         $result = netsh wlan connect name="$SSID" 2>&1
-        
-        Start-Sleep -Seconds 3
+        Start-Sleep -Seconds 5
         
         $newInterface = netsh wlan show interfaces 2>&1
         $newSSID = $null
+        $newBSSID = $null
         foreach ($line in $newInterface -split "`r`n") {
-            if ($line -match "^\s*SSID\s+:\s+(.+)") {
-                $newSSID = $matches[1].Trim()
-                break
-            }
+            if ($line -match "SSID\s*:\s*(.+)") { $newSSID = $matches[1].Trim() }
+            if ($line -match "BSSID\s*:\s*([0-9a-fA-F-]+)") { $newBSSID = $matches[1].Trim() }
         }
         
         if ($newSSID -eq $SSID) {
-            Write-Host ("Successfully connected to $SSID on $Band band!") -ForegroundColor Green
+            Write-Host ("Successfully connected to $SSID!") -ForegroundColor Green
+            Write-Host ("BSSID: $newBSSID") -ForegroundColor Green
             return $true
         } else {
             Write-Host ("Failed to connect to $SSID.") -ForegroundColor Red
@@ -291,6 +236,40 @@ function Connect-ToWifiBand {
     }
 }
 
+# Function to display detailed network information
+function Show-NetworkDetails {
+    param([object]$Network)
+    
+    Clear-Host
+    Write-Host "`n" + ("=" * 80)
+    Write-Host ("Network: $($Network.SSID)") -ForegroundColor Cyan
+    Write-Host ("=" * 80)
+    Write-Host ("Signal strength: $($Network.BestSignal)%")
+    Write-Host ("Available bands: $($Network.AvailableBands -join ', ')")
+    Write-Host ("-" * 80)
+    
+    # Always show BSSID details for networks with multiple bands
+    if ($Verbose -or $Network.AvailableBands.Count -gt 1) {
+        Write-Host "`nBSSID Details:" -ForegroundColor Cyan
+        Write-Host ("-" * 80)
+        Write-Host ("{0,-20} {1,-8} {2,-10} {3,5}%" -f "BSSID", "Channel", "Band", "Signal")
+        Write-Host ("-" * 80)
+        
+        $sortedBSSIDs = $Network.BSSIDDetails | Sort-Object { $_.Signal } -Descending
+        foreach ($bssid in $sortedBSSIDs) {
+            $channelStr = if ($bssid.Channel -ne $null) { $bssid.Channel } else { "N/A" }
+            $line = "{0,-20} {1,-8} {2,-10} {3,5}%" -f $bssid.BSSID, $channelStr, $bssid.Band, $bssid.Signal
+            Write-Host $line
+        }
+        Write-Host "`n" + ("=" * 80)
+    }
+    
+    # If network has multiple bands but we're not showing details, show a hint
+    if (-not $Verbose -and $Network.AvailableBands.Count -gt 1) {
+        Write-Host ("`nPress 'D' when selecting this network to see all BSSIDs and bands.") -ForegroundColor Yellow
+    }
+}
+
 # Function to display available networks in a table
 function Show-NetworkList {
     param([array]$Networks)
@@ -298,16 +277,14 @@ function Show-NetworkList {
     Write-Host "`n" + ("=" * 80)
     Write-Host "Available WiFi Networks" -ForegroundColor Cyan
     Write-Host ("=" * 80)
-    Write-Host ("{0,-30} {1,10} {2,15}" -f "SSID", "Signal", "Available Bands")
+    Write-Host ("{0,-3} {1,-30} {2,6}%  {3}" -f "#", "SSID", "Sig", "Bands") -ForegroundColor DarkGray
     Write-Host ("-" * 80)
     
     $index = 1
     foreach ($net in $Networks) {
-        $bandsStr = ($net.AvailableBands -join ", ")
-        if ($bandsStr -eq "") {
-            $bandsStr = "Unknown"
-        }
-        Write-Host ("{0,2}. {1,-28} {2,3}%   {3}" -f $index, $net.SSID, $net.BestSignal, $bandsStr)
+        $bandsStr = $net.AvailableBands -join ","
+        if ($bandsStr -eq "") { $bandsStr = "Unknown" }
+        Write-Host ("{0,2}. {1,-29} {2,4}%   {3}" -f $index, $net.SSID, $net.BestSignal, $bandsStr)
         $index++
     }
     Write-Host ("=" * 80)
@@ -326,6 +303,8 @@ function Show-MainMenu {
     
     Write-Host "`nSelect an option:" -ForegroundColor Cyan
     Write-Host "  [1-$($networks.Count)] Select a network to connect to"
+    Write-Host "  [V] Toggle verbose mode (shows all BSSIDs)"
+    Write-Host "  [D] Debug mode (shows raw parsing data)"
     Write-Host "  [R] Refresh network list"
     Write-Host "  [Q] Quit"
     Write-Host "`nEnter your choice:" -ForegroundColor Yellow -NoNewline
@@ -336,6 +315,20 @@ function Show-MainMenu {
         exit 0
     }
     elseif ($choice -match "^[rR]$") {
+        Show-MainMenu
+        return
+    }
+    elseif ($choice -match "^[vV]$") {
+        $script:Verbose = -not $Verbose
+        Write-Host ("Verbose mode: $Verbose") -ForegroundColor Yellow
+        Start-Sleep -Seconds 1
+        Show-MainMenu
+        return
+    }
+    elseif ($choice -match "^[dD]$") {
+        $script:Debug = -not $Debug
+        Write-Host ("Debug mode: $Debug") -ForegroundColor Yellow
+        Start-Sleep -Seconds 1
         Show-MainMenu
         return
     }
@@ -359,13 +352,7 @@ function Show-MainMenu {
 function Show-NetworkOptions {
     param([object]$Network)
     
-    Clear-Host
-    Write-Host "`n" + ("=" * 80)
-    Write-Host ("Network: $($Network.SSID)") -ForegroundColor Cyan
-    Write-Host ("=" * 80)
-    Write-Host ("Available bands: $($Network.AvailableBands -join ', ')")
-    Write-Host ("Signal strength: $($Network.BestSignal)%")
-    Write-Host ("-" * 80)
+    Show-NetworkDetails -Network $Network
     
     if ($Network.AvailableBands.Count -eq 0) {
         Write-Host ("No band information available for this network.") -ForegroundColor Yellow
@@ -379,7 +366,7 @@ function Show-NetworkOptions {
     
     $index = 1
     $bandMap = @{}
-    foreach ($band in $Network.AvailableBands | Sort-Object) {
+    foreach ($band in $Network.AvailableBands) {
         Write-Host "  [$index] $band"
         $bandMap[$index] = $band
         $index++
@@ -424,14 +411,20 @@ function Show-NetworkOptions {
 }
 
 # Main execution
+Clear-Host
 Write-Host "WiFi Band Switcher for Windows" -ForegroundColor Cyan
-Write-Host "Version 1.0" -ForegroundColor Cyan
+Write-Host "Version 1.0" -ForegroundColor DarkGray
 Write-Host ""
 
 # Handle command-line arguments
 if ($ScanOnly) {
     $networks = Get-AvailableWifiNetworks
     Show-NetworkList -Networks $networks
+    exit 0
+}
+
+if ($Debug) {
+    $networks = Get-AvailableWifiNetworks
     exit 0
 }
 
@@ -450,7 +443,8 @@ if ($SSID) {
     $networks = Get-AvailableWifiNetworks
     $targetNetwork = $networks | Where-Object { $_.SSID -eq $SSID }
     if ($targetNetwork) {
-        Show-NetworkOptions -Network $targetNetwork
+        $Verbose = $true
+        Show-NetworkDetails -Network $targetNetwork
     } else {
         Write-Host ("Network '$SSID' not found.") -ForegroundColor Red
         exit 1
